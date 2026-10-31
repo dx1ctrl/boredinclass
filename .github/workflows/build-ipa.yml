@@ -1,0 +1,70 @@
+name: Build IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Git URL or owner/name of the iOS app repo"
+        required: true
+      ref:
+        description: "Branch, tag or commit (blank = default branch)"
+        required: false
+      scheme:
+        description: "Xcode scheme (blank = first scheme found)"
+        required: false
+      project:
+        description: "Path to .xcworkspace or .xcodeproj (blank = auto-detect)"
+        required: false
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout app
+        env:
+          REPO: ${{ inputs.repo }}
+          REF: ${{ inputs.ref }}
+        run: |
+          case "$REPO" in *://*|git@*) url="$REPO" ;; *) url="https://github.com/$REPO.git" ;; esac
+          git clone --recursive "$url" app
+          if [ -n "$REF" ]; then git -C app checkout "$REF" && git -C app submodule update --init --recursive; fi
+
+      - name: Install CocoaPods deps
+        working-directory: app
+        run: |
+          podfile=$(find . -name Podfile -not -path '*/Pods/*' | head -1)
+          if [ -n "$podfile" ]; then (cd "$(dirname "$podfile")" && pod install); fi
+
+      - name: Build unsigned IPA
+        working-directory: app
+        env:
+          SCHEME: ${{ inputs.scheme }}
+          PROJECT: ${{ inputs.project }}
+        run: |
+          set -eo pipefail
+          if [ -z "$PROJECT" ]; then
+            # Prefer a workspace (CocoaPods/multi-project), skip the one embedded inside every .xcodeproj
+            PROJECT=$(find . -name '*.xcworkspace' -not -path '*.xcodeproj/*' -not -path '*/Pods/*' | head -1)
+            [ -n "$PROJECT" ] || PROJECT=$(find . -name '*.xcodeproj' -not -path '*/Pods/*' | head -1)
+          fi
+          [ -n "$PROJECT" ] || { echo "::error::No .xcworkspace or .xcodeproj found"; exit 1; }
+          case "$PROJECT" in *.xcworkspace) flag=-workspace ;; *) flag=-project ;; esac
+          if [ -z "$SCHEME" ]; then
+            SCHEME=$(xcodebuild -list -json $flag "$PROJECT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("workspace") or d.get("project"))["schemes"][0])')
+          fi
+          echo "Building $PROJECT scheme $SCHEME"
+
+          xcodebuild archive $flag "$PROJECT" -scheme "$SCHEME" \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+          mkdir -p "$RUNNER_TEMP/out/Payload"
+          cp -R "$RUNNER_TEMP"/app.xcarchive/Products/Applications/*.app "$RUNNER_TEMP/out/Payload/"
+          (cd "$RUNNER_TEMP/out" && zip -qry "$GITHUB_WORKSPACE/$SCHEME.ipa" Payload)
+          echo "IPA_NAME=$SCHEME" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IPA_NAME }}-ipa
+          path: ${{ env.IPA_NAME }}.ipa
